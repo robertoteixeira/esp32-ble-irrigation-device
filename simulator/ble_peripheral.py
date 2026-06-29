@@ -45,6 +45,7 @@ class Application(dbus.service.Object):
 
     @dbus.service.method(DBUS_OM_IFACE, out_signature="a{oa{sa{sv}}}")
     def GetManagedObjects(self):
+        print("GetManagedObjects called")
         response = {}
 
         for service in self.services:
@@ -70,12 +71,8 @@ class Service(dbus.service.Object):
     def get_properties(self):
         return {
             GATT_SERVICE_IFACE: {
-                "UUID": self.uuid,
-                "Primary": self.primary,
-                "Characteristics": dbus.Array(
-                    self.get_characteristic_paths(),
-                    signature="o",
-                ),
+                "UUID": dbus.String(self.uuid),
+                "Primary": dbus.Boolean(self.primary),
             }
         }
 
@@ -90,6 +87,7 @@ class Service(dbus.service.Object):
 
     @dbus.service.method(DBUS_PROP_IFACE, in_signature="s", out_signature="a{sv}")
     def GetAll(self, interface):
+        print("Service GetAll called:", interface)
         if interface != GATT_SERVICE_IFACE:
             raise dbus.exceptions.DBusException(
                 "Invalid interface",
@@ -117,8 +115,8 @@ class Characteristic(dbus.service.Object):
         return {
             GATT_CHARACTERISTIC_IFACE: {
                 "Service": self.service.get_path(),
-                "UUID": self.uuid,
-                "Flags": self.flags,
+                "UUID": dbus.String(self.uuid),
+                "Flags": dbus.Array(self.flags, signature="s"),
             }
         }
 
@@ -127,6 +125,7 @@ class Characteristic(dbus.service.Object):
 
     @dbus.service.method(DBUS_PROP_IFACE, in_signature="s", out_signature="a{sv}")
     def GetAll(self, interface):
+        print("Characteristic GetAll called:", interface)
         if interface != GATT_CHARACTERISTIC_IFACE:
             raise dbus.exceptions.DBusException(
                 "Invalid interface",
@@ -167,6 +166,156 @@ class FirmwareVersionCharacteristic(Characteristic):
             service,
         )
 
+    @dbus.service.method(
+        GATT_CHARACTERISTIC_IFACE,
+        in_signature="a{sv}",
+        out_signature="ay",
+    )
     def ReadValue(self, options):
         print("Firmware version read")
         return text_to_dbus_byte_array(FIRMWARE_VERSION)
+
+class Advertisement(dbus.service.Object):
+    PATH_BASE = "/org/bluez/example/advertisement"
+
+    def __init__(self, bus, index, advertising_type):
+        self.path = self.PATH_BASE + str(index)
+        self.bus = bus
+        self.advertising_type = advertising_type
+        self.service_uuids = []
+        self.local_name = None
+        self.includes = []
+
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_properties(self):
+        properties = {
+            "Type": self.advertising_type,
+        }
+
+        if self.service_uuids:
+            properties["ServiceUUIDs"] = dbus.Array(
+                self.service_uuids,
+                signature="s",
+            )
+
+        if self.local_name:
+            properties["LocalName"] = dbus.String(self.local_name)
+
+        if self.includes:
+            properties["Includes"] = dbus.Array(
+                self.includes,
+                signature="s",
+            )
+
+        return {
+            LE_ADVERTISEMENT_IFACE: properties
+        }
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def add_service_uuid(self, uuid):
+        self.service_uuids.append(uuid)
+
+    def add_local_name(self, name):
+        self.local_name = name
+
+    def add_include(self, include):
+        self.includes.append(include)
+
+    @dbus.service.method(DBUS_PROP_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        if interface != LE_ADVERTISEMENT_IFACE:
+            raise dbus.exceptions.DBusException(
+                "Invalid interface",
+                name="org.freedesktop.DBus.Error.InvalidArgs",
+            )
+
+        return self.get_properties()[LE_ADVERTISEMENT_IFACE]
+
+    @dbus.service.method(LE_ADVERTISEMENT_IFACE, in_signature="", out_signature="")
+    def Release(self):
+        print("Advertisement released")
+
+class IrrigationAdvertisement(Advertisement):
+    def __init__(self, bus, index):
+        Advertisement.__init__(self, bus, index, "peripheral")
+        self.add_service_uuid(SERVICE_UUID)
+        self.add_local_name(DEVICE_NAME)
+
+def register_app_cb():
+    print("GATT application registered")
+
+def register_app_error_cb(error):
+    print("Failed to register GATT application:", error)
+    mainloop.quit()
+
+def register_ad_cb():
+    print("Advertisement registered")
+
+def register_ad_error_cb(error):
+    print("Failed to register advertisement:", error)
+    mainloop.quit()
+
+def main():
+    global mainloop
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+
+    bus = dbus.SystemBus()
+
+    adapter = bus.get_object(BLUEZ_SERVICE_NAME, ADAPTER_PATH)
+
+    service_manager = dbus.Interface(
+        adapter,
+        GATT_MANAGER_IFACE,
+    )
+
+    advertising_manager = dbus.Interface(
+        adapter,
+        LE_ADVERTISING_MANAGER_IFACE,
+    )
+
+    app = Application(bus)
+    advertisement = IrrigationAdvertisement(bus, 0)
+
+    service_manager.RegisterApplication(
+        app.get_path(),
+        {},
+        reply_handler=register_app_cb,
+        error_handler=register_app_error_cb,
+    )
+
+    advertising_manager.RegisterAdvertisement(
+        advertisement.get_path(),
+        {},
+        reply_handler=register_ad_cb,
+        error_handler=register_ad_error_cb,
+    )
+
+    print("BLE irrigation simulator running")
+    print("Device name:", DEVICE_NAME)
+    print("Service UUID:", SERVICE_UUID)
+    print("Press Ctrl+C to stop")
+
+    mainloop = GLib.MainLoop()
+    try:
+        mainloop.run()
+    except KeyboardInterrupt:
+        print("Stopping BLE irrigation simulator")
+    finally:
+        try:
+            advertising_manager.UnregisterAdvertisement(advertisement.get_path())
+            print("Advertisement unregistered")
+        except dbus.exceptions.DBusException as error:
+            print("Advertisement unregister skipped:", error)
+
+        try:
+            service_manager.UnregisterApplication(app.get_path())
+            print("GATT application unregistered")
+        except dbus.exceptions.DBusException as error:
+            print("GATT unregister skipped:", error)
+
+if __name__ == "__main__":
+    main()
